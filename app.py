@@ -530,7 +530,7 @@ HTML_PAGE = r"""
 <html lang="ko">
 <head>
 <meta charset="UTF-8"/>
-<title>Raon Vision Search</title>
+<title>XY Zvec - Raon Vision Search</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
@@ -607,7 +607,7 @@ HTML_PAGE = r"""
 <body>
 
 <header>
-  <h1>🔍 Raon Vision Search</h1>
+  <h1>🔍 XY Zvec - Raon Vision Search</h1>
   <span style="font-size:13px;color:#666;">
     자연어로 이미지를 검색하세요
   </span>
@@ -877,7 +877,7 @@ def main():
     logger.info("[메인] PyWebView 창 생성 시작")
     api = Api()
     window = webview.create_window(
-        "Raon Vision Search",
+        "XY Zvec - Raon Vision Search",
         html=HTML_PAGE,
         js_api=api,
         width=1200,
