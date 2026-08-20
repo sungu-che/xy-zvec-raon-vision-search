@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedModel
 
-from .configuration_raonve import RaonVEConfig
+from configuration_raonve import RaonVEConfig
 
 
 _raon_repo_id = None
@@ -186,7 +186,8 @@ class RaonVEProcessor:
             tok_mod = importlib.import_module("raon_vision_encoder.tokenizer")
             tokenizer = tok_mod.HFTokenizer(
                 t["hf_tokenizer_name"], context_length=t.get("context_length", 64),
-                tokenizer_mode=t.get("tokenizer_mode"), **t.get("tokenizer_kwargs", {}),
+                tokenizer_mode=t.get("tokenizer_mode"), token=False,
+                **t.get("tokenizer_kwargs", {}),
             )
         return cls(patch_size=ps, tokenizer=tokenizer)
 

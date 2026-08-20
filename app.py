@@ -70,6 +70,17 @@ logger.info("APP_DIR: %s", APP_DIR)
 logger.info("LOCAL_APP_DATA: %s", LOCAL_APP_DATA)
 logger.info("LOG_FILE: %s", LOG_FILE)
 
+# ── 만료된 HF 토큰 파일 제거 (401 방지) ────────────────────
+_hf_token_path = os.path.join(
+    os.path.expanduser("~"), ".cache", "huggingface", "token"
+)
+if os.path.isfile(_hf_token_path):
+    try:
+        os.remove(_hf_token_path)
+        logger.info("[HF] 만료된 토큰 파일 제거: %s", _hf_token_path)
+    except Exception as e:
+        logger.warning("[HF] 토큰 파일 제거 실패: %s", e)
+
 
 # ============================================================
 #  zvec – 경량 numpy 벡터 DB
@@ -183,32 +194,40 @@ def ensure_model_files() -> str:
 
 
 def load_raon_model(model_dir: str):
-    """RaonVEModel + Processor 로드."""
+    """RaonVEModel + Processor 로드 (float16, 메모리 최적화)."""
+    import gc
     from configuration_raonve import RaonVEConfig
     from modeling_raonve import RaonVEModel, RaonVEProcessor
 
-    print("[모델] config 로드 중…")
+    logger.info("[모델] config 로드 중…")
     config = RaonVEConfig.from_pretrained(model_dir)
 
-    print("[모델] RaonVEModel 로드 중…")
+    logger.info("[모델] RaonVEModel 생성 중…")
     model = RaonVEModel(config)
 
-    # safetensors 가중치 로드
+    # safetensors 가중치 로드 (float16 변환)
     weight_path = os.path.join(model_dir, "model.safetensors")
     if os.path.isfile(weight_path):
         from safetensors.torch import load_file
-        state = load_file(weight_path)
+        logger.info("[모델] 가중치 로드 중: %s", weight_path)
+        state = load_file(weight_path, device="cpu")
+        state = {k: v.to(torch.float16) for k, v in state.items()}
         model.load_state_dict(state, strict=False)
-        print(f"[모델] 가중치 로드 완료: {weight_path}")
+        del state
+        gc.collect()
+        logger.info("[모델] 가중치 로드 완료 (float16)")
 
     model.eval()
+    model = model.half()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    print(f"[모델] 디바이스: {device}")
+    gc.collect()
+    logger.info("[모델] 디바이스: %s, dtype: float16", device)
 
-    print("[프로세서] 로드 중…")
+    logger.info("[프로세서] 로드 중…")
     processor = RaonVEProcessor.from_pretrained(model_dir)
 
+    gc.collect()
     return model, processor, device
 
 # ============================================================
@@ -385,7 +404,7 @@ class Api:
             self.zvec_db = ZVec(dim=1152)
             logger.info("[인덱싱 워커] 총 이미지: %d개", self.total_images)
 
-            batch_size = 8
+            batch_size = 1
             for start in range(0, len(images), batch_size):
                 batch_paths = images[start : start + batch_size]
                 pil_imgs = []
@@ -407,14 +426,16 @@ class Api:
                 pixel_mask = inputs["pixel_attention_mask"].to(self.device)
                 spatial_shapes = inputs["spatial_shapes"].to(self.device)
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     feats = self.model.encode_image(
                         pixel_values,
                         pixel_attention_mask=pixel_mask,
                         spatial_shapes=spatial_shapes,
                     )  # [B, 1152]
 
-                feats_np = feats.cpu().numpy()
+                feats_np = feats.float().cpu().numpy()
+                del pixel_values, pixel_mask, spatial_shapes, feats
+                gc.collect()
                 for i, p in enumerate(valid_paths):
                     self.zvec_db.add(
                         vec_id=p,
@@ -471,7 +492,7 @@ class Api:
             input_ids = inputs["input_ids"].to(self.device)
             logger.debug("[검색] input_ids shape: %s", input_ids.shape)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 text_feat = self.model.encode_text(input_ids)  # [1, 1152]
 
             text_np = text_feat.cpu().numpy().squeeze(0)
@@ -675,22 +696,23 @@ window.addEventListener("DOMContentLoaded", function() {
   setButtonsEnabled(false);
 
   waitForApi(async function() {
-    setStatus("⏳ 모델 파일 확인 중...");
+    setStatus("⏳ 모델 자동 로딩 중...");
     try {
-      const d = await pywebview.api.get_download_progress();
-      if (d.ready) {
-        modelReady = true;
-        setButtonsEnabled(true);
-        document.getElementById("btnIndex").disabled = true;
-        setStatus("✅ 모델 로드 완료! 폴더를 선택하세요.");
-        return;
+      console.log("[JS] 자동 init_model 호출");
+      const res = await pywebview.api.init_model();
+      console.log("[JS] init_model 응답:", JSON.stringify(res));
+      if (res.ok) {
+        startDownloadPolling();
+      } else {
+        setStatus("⚠️ " + res.msg);
+        document.getElementById("btnDownload").style.display = "inline-block";
+        document.getElementById("btnDownload").disabled = false;
       }
-      document.getElementById("btnDownload").style.display = "inline-block";
-      setStatus("⬇️ 모델 다운로드가 필요합니다. 아래 버튼을 클릭하세요.");
-      document.getElementById("btnDownload").disabled = false;
     } catch(e) {
-      console.error("[JS] 초기 확인 예외:", e);
+      console.error("[JS] 자동 초기화 예외:", e);
       setStatus("❌ 초기화 오류: " + e);
+      document.getElementById("btnDownload").style.display = "inline-block";
+      document.getElementById("btnDownload").disabled = false;
     }
   });
 });
