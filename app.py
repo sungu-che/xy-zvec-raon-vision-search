@@ -3,6 +3,7 @@
 # ============================================================
 import os
 import sys
+import gc
 import json
 import time
 import logging
