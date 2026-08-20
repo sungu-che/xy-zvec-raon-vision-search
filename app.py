@@ -13,6 +13,9 @@ import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 
+import warnings
+warnings.filterwarnings("ignore", message="Palette images")
+
 import numpy as np
 import requests
 import torch
@@ -412,7 +415,14 @@ class Api:
                 valid_paths = []
                 for p in batch_paths:
                     try:
-                        img = Image.open(p).convert("RGB")
+                        img = Image.open(p)
+                        if img.mode in ("RGBA", "LA", "P"):
+                            img = img.convert("RGBA")
+                            bg = Image.new("RGB", img.size, (255, 255, 255))
+                            bg.paste(img, mask=img.split()[-1])
+                            img = bg
+                        else:
+                            img = img.convert("RGB")
                         pil_imgs.append(img)
                         valid_paths.append(p)
                     except Exception as img_err:
@@ -448,7 +458,7 @@ class Api:
                 self.progress_msg = (
                     f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
                 )
-                logger.debug("[인덱싱] %s", self.progress_msg)
+                logger.info("[인덱싱] %s", self.progress_msg)
 
             save_path = os.path.join(LOCAL_APP_DATA, "zvec_index.npz")
             self.zvec_db.save(save_path)

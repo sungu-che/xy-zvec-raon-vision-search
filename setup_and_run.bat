@@ -124,7 +124,8 @@ if %errorlevel% equ 0 (
     echo.
     echo [GPU] NVIDIA GPU detected. Attempting CUDA upgrade...
     for /f "tokens=*" %%d in ('nvidia-smi -L 2^>nul') do echo [GPU] %%d
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 >nul 2>&1
+    echo [INFO] Force reinstalling PyTorch with CUDA 12.1...
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps
     if !errorlevel! equ 0 (
         echo [OK] Upgraded to CUDA 12.1 build.
     ) else (

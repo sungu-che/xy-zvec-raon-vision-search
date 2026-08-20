@@ -214,7 +214,13 @@ class RaonVEProcessor:
             ps = self.patch_size
             all_p, all_m, all_s = [], [], []
             for img in imgs:
-                img = img.convert("RGB")
+                if img.mode in ("RGBA", "LA", "P"):
+                    img = img.convert("RGBA")
+                    _bg = Image.new("RGB", img.size, (255, 255, 255))
+                    _bg.paste(img, mask=img.split()[-1])
+                    img = _bg
+                else:
+                    img = img.convert("RGB")
                 w, h = img.size
                 th, tw = get_size(h, w, ps, mnp)
                 t = self._post(img.resize((tw, th), Image.BICUBIC))
