@@ -193,9 +193,12 @@ class ZVec:
         top_idx = np.argsort(scores)[::-1][:top_k]
         results = []
         for i in top_idx:
-            results.append(
-                {"id": self.ids[i], "score": float(scores[i]), **self.meta[i]}
-            )
+            if scores[i] > 0.0:
+                results.append({
+                    "id": self.ids[i],
+                    "score": float(scores[i]),
+                    **self.meta[i],
+                })
         return results
 
     # ── 저장 / 로드 ──────────────────────────────────────────
