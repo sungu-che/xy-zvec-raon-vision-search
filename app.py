@@ -826,6 +826,49 @@ class Api:
         }
 
     # ── 자연어 검색 ───────────────────────────────────────────
+
+    # ── 전체 목록 조회 ────────────────────────────────────
+    def list_all(self):
+        logger.info("[이벤트] 전체 목록 요청")
+        block = self._check_ready()
+        if block:
+            return block
+        if len(self.zvec_db) == 0:
+            return {"ok": False, "msg": "인덱스가 비어 있습니다."}
+        results = []
+        for i in range(len(self.zvec_db)):
+            meta = self.zvec_db.meta[i]
+            results.append({
+                "id": self.zvec_db.ids[i],
+                "path": meta.get("path", ""),
+                "name": meta.get("name", ""),
+            })
+        for r in results:
+            r["thumb_b64"] = self._make_thumb_b64(r.get("path", ""))
+        logger.info("[전체 목록] %d개 반환", len(results))
+        return {"ok": True, "results": results}
+
+    # ── 인스 초기화 ─────────────────────────────────────
+    def reset_index(self):
+        block = self._check_ready()
+        if block:
+            return block
+        if self._indexing:
+            return {"ok": False, "msg": "인덱싱 중에는 초기화할 수 없습니다."}
+        self.zvec_db = ZVec(dim=1152)
+        self.recent_indexed = []
+        self.indexed_count = 0
+        self.total_images = 0
+        self.last_indexed_folder = ""
+        for f in (self._index_path, self._index_meta_path, self._index_state_path):
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except Exception as e:
+                logger.warning("[리셋] 파일 삭제 실패: %s (%s)", f, e)
+        logger.info("[리셋] 인덱스가 초기화되었습니다.")
+        return {"ok": True, "msg": "인덱스가 초기화되었습니다."}
+
     def search(self, query: str, top_k: int = 20):
         logger.info("[이벤트] 검색: '%s' (top_k=%d)", query, top_k)
         block = self._check_ready()
@@ -1068,14 +1111,19 @@ HTML_PAGE = r"""
   <button id="btnFolder" onclick="selectFolder()" disabled>📁 폴더 선택</button>
   <button id="btnIndex" onclick="startIndexing()" disabled>⚙️ 인덱싱 시작</button>
   <button id="btnLoadIdx" onclick="loadIndex()" disabled>📂 저장된 인덱스 로드</button>
+  <button id="btnReset" onclick="resetIndex()" disabled style="background:#dc2626;">🗑️ 인덱스 초기화</button>
   <select id="langSelect" onchange="changeLanguage()" disabled
           style="padding:10px 14px;border-radius:8px;border:1px solid #3a3d4a;
                  background:#1e2130;color:#fff;font-size:14px;outline:none;
                  cursor:pointer;">
   </select>
   <div class="search-box">
+    <button id="btnClear" title="검색어 지우기"
+            style="display:none;background:#3a3d4a;padding:10px 14px;"
+            onclick="var i=document.getElementById('searchInput');i.value='';this.style.display='none';i.focus();showAll();">✕</button>
     <input id="searchInput" type="text" disabled
-           placeholder="자연어로 검색… 예: 바다 위 일몰, 빨간 자동차"
+           placeholder="자연어로 검색… (빈칸 엔터 = 전체 목록)"
+           oninput="document.getElementById('btnClear').style.display=this.value?'inline-block':'none'"
            onkeydown="if(event.key==='Enter')doSearch()"/>
     <button id="btnSearch" onclick="doSearch()" disabled>검색</button>
   </div>
@@ -1120,6 +1168,7 @@ function setButtonsEnabled(enabled) {
   document.getElementById("btnFolder").disabled = !enabled;
   document.getElementById("btnIndex").disabled = !enabled;
   document.getElementById("btnLoadIdx").disabled = !enabled;
+  document.getElementById("btnReset").disabled = !enabled;
   document.getElementById("btnSearch").disabled = !enabled;
   document.getElementById("searchInput").disabled = !enabled;
   document.getElementById("langSelect").disabled = !enabled;
@@ -1319,13 +1368,66 @@ async function loadIndex() {
   }
 }
 
+// ── 전체 목록 ─────────────────────────────────────────────
+async function showAll() {
+  try {
+    if (!modelReady) { setStatus("⚠️ 모델 다운로드 후 이용하세요."); return; }
+    setStatus("📋 전체 목록 조회 중...");
+    const res = await pywebview.api.list_all();
+    console.log("[JS] list_all 응답:", res.ok, res.results ? res.results.length : 0);
+    if (!res.ok) { setStatus("⚠️ " + res.msg); return; }
+    renderAll(res.results);
+    setStatus("📋 전체 목록 " + res.results.length + "개");
+  } catch(e) {
+    console.error("[JS] showAll 예외:", e);
+    setStatus("❌ 전체 목록 오류: " + e);
+  }
+}
+
+function renderAll(items) {
+  const g = document.getElementById("gallery");
+  if (!items || items.length === 0) {
+    g.innerHTML = '<div class="empty-msg">인덱스에 항목이 없습니다.</div>';
+    return;
+  }
+  let html = '<div style="grid-column:1/-1;color:#7eb8ff;font-size:13px;padding:4px 0;">📋 전체 목록 (' + items.length + '개)</div>';
+  for (const r of items) {
+    const imgSrc = r.thumb_b64 || "";
+    const safeName = (r.name || "").replace(/'/g, "\\'");
+    html += `
+      <div class="card">
+        <img src="${imgSrc}"
+             onclick="showImageModal(this.src, '${safeName}', '')"
+             onerror="this.style.display='none'"/>
+        <div class="info">📄 ${r.name}</div>
+      </div>`;
+  }
+  g.innerHTML = html;
+}
+
+// ── 인스 초기화 ─────────────────────────────────────────
+async function resetIndex() {
+  if (!confirm("인덱스를 완전히 초기화할까요?")) return;
+  try {
+    const res = await pywebview.api.reset_index();
+    setStatus(res.ok ? "✅ " + res.msg : "⚠️ " + res.msg);
+    if (res.ok) {
+      document.getElementById("gallery").innerHTML =
+        '<div class="empty-msg">인덱스가 초기화되었습니다. 폴더를 선택하고 인싱하세요.</div>';
+    }
+  } catch(e) {
+    console.error("[JS] resetIndex 예외:", e);
+    setStatus("❌ 초기화 오류: " + e);
+  }
+}
+
 // ── 검색 ──────────────────────────────────────────────────
 async function doSearch() {
   const q = document.getElementById("searchInput").value.trim();
   console.log("[JS] doSearch:", q);
-  if (!q) return;
+  if (!modelReady) { setStatus("⚠️ 모델 다운로드 후 이용하세요."); return; }
+  if (!q) { await showAll(); return; }
   try {
-    if (!modelReady) { setStatus("⚠️ 모델 다운로드 후 이용하세요."); return; }
     setStatus("🔍 검색 중: " + q);
     const res = await pywebview.api.search(q, 20);
     console.log("[JS] search 응답:", res.ok, res.results ? res.results.length : 0, "개");
