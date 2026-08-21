@@ -9,3 +9,4 @@ pillow>=10.0.0
 numpy>=1.26.0
 ftfy>=6.1.0
 sentencepiece>=0.2.0
+pymupdf>=1.24.0

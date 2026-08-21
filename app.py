@@ -51,7 +51,8 @@ WEIGHT_URL = (
     "/resolve/main/model.safetensors"
 )
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".gif"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".gif", ".pdf"}
+PDF_EXTS = {".pdf"}
 
 # ── 번역 모델 정의 ──────────────────────────────────────────
 import locale
@@ -728,16 +729,22 @@ class Api:
                 valid_paths = []
                 for p in batch_paths:
                     try:
-                        img = Image.open(p)
-                        if img.mode in ("RGBA", "LA", "P"):
-                            img = img.convert("RGBA")
-                            bg = Image.new("RGB", img.size, (255, 255, 255))
-                            bg.paste(img, mask=img.split()[-1])
-                            img = bg
+                        if Path(p).suffix.lower() in PDF_EXTS:
+                            pdf_imgs = self._pdf_to_images(p)
+                            for page_idx, pi in enumerate(pdf_imgs):
+                                pil_imgs.append(pi)
+                                valid_paths.append((p, page_idx + 1))
                         else:
-                            img = img.convert("RGB")
-                        pil_imgs.append(img)
-                        valid_paths.append(p)
+                            img = Image.open(p)
+                            if img.mode in ("RGBA", "LA", "P"):
+                                img = img.convert("RGBA")
+                                bg = Image.new("RGB", img.size, (255, 255, 255))
+                                bg.paste(img, mask=img.split()[-1])
+                                img = bg
+                            else:
+                                img = img.convert("RGB")
+                            pil_imgs.append(img)
+                            valid_paths.append((p, None))
                     except Exception as img_err:
                         logger.warning("[인덱싱] 로드 실패: %s (%s)", p, img_err)
                         continue
@@ -758,15 +765,17 @@ class Api:
                     )  # [B, 1152]
 
                 feats_np = feats.cpu().numpy()
-                for i, p in enumerate(valid_paths):
+                for i, (p, page_num) in enumerate(valid_paths):
+                    vec_id = f"{p}#p{page_num}" if page_num else p
+                    display_name = f"{Path(p).name} (p.{page_num})" if page_num else Path(p).name
                     self.zvec_db.add(
-                        vec_id=p,
+                        vec_id=vec_id,
                         vector=feats_np[i],
-                        metadata={"path": p, "name": Path(p).name},
+                        metadata={"path": p, "name": display_name, "page": page_num},
                     )
                     self.indexed_count += 1
                     self.recent_indexed.append(
-                        {"path": p, "name": Path(p).name, "thumb_b64": self._make_thumb_b64(p)}
+                        {"path": p, "name": display_name, "thumb_b64": self._make_thumb_b64(p)}
                     )
                     if len(self.recent_indexed) > 30:
                         self.recent_indexed = self.recent_indexed[-30:]
@@ -844,10 +853,36 @@ class Api:
             logger.error("[검색 오류] %s", e, exc_info=True)
             return {"ok": False, "msg": str(e)}
 
+    # ── PDF → 이미지 변환 ────────────────────────────────────
+    def _pdf_to_images(self, pdf_path: str, max_pages: int = 10, dpi: int = 150) -> list:
+        """PDF 각 페이지를 PIL Image 리스트로 변환."""
+        try:
+            import fitz  # pymupdf
+            doc = fitz.open(pdf_path)
+            images = []
+            page_count = min(len(doc), max_pages)
+            for i in range(page_count):
+                page = doc[i]
+                pix = page.get_pixmap(dpi=dpi)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                images.append(img)
+            doc.close()
+            logger.info("[PDF] %s → %d페이지 변환", Path(pdf_path).name, page_count)
+            return images
+        except Exception as e:
+            logger.warning("[PDF] 변환 실패: %s (%s)", pdf_path, e)
+            return []
+
     # ── 썸네일 base64 생성 (크로스 플랫폼) ────────────────────
     def _make_thumb_b64(self, path: str, size: int = 220) -> str:
         try:
-            img = Image.open(path)
+            if Path(path).suffix.lower() in PDF_EXTS:
+                imgs = self._pdf_to_images(path, max_pages=1, dpi=100)
+                if not imgs:
+                    return ""
+                img = imgs[0]
+            else:
+                img = Image.open(path)
             img.thumbnail((size, size), Image.LANCZOS)
             if img.mode != "RGB":
                 img = img.convert("RGB")
