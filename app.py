@@ -1011,12 +1011,12 @@ let modelReady = false;
 
 // ── pywebview.api 준비 대기 ───────────────────────────────
 function waitForApi(callback) {
-  if (window.pywebview && window.pywebview.api) {
+  if (window.pywebview && window.pywebview.api && typeof window.pywebview.api.init_model === 'function') {
     apiReady = true;
-    console.log("[JS] pywebview.api 준비 완료");
+    console.log("[JS] pywebview.api 준비 완료 (메서드 확인됨)");
     callback();
   } else {
-    setTimeout(function() { waitForApi(callback); }, 200);
+    setTimeout(function() { waitForApi(callback); }, 300);
   }
 }
 
