@@ -1000,6 +1000,54 @@ HTML_PAGE = r"""
     grid-column:1/-1; text-align:center;
     color:#555; padding:60px 0; font-size:15px;
   }
+  .card img {
+    cursor:zoom-in;
+  }
+  #imgModal {
+    display:none;
+    position:fixed;
+    top:0; left:0;
+    width:100vw; height:100vh;
+    background:rgba(0,0,0,0.85);
+    z-index:9999;
+    align-items:center;
+    justify-content:center;
+    cursor:pointer;
+  }
+  #imgModalInner {
+    position:relative;
+    max-width:90vw;
+    max-height:90vh;
+    text-align:center;
+  }
+  #imgModalClose {
+    position:absolute;
+    top:-44px; right:0;
+    background:#ef4444;
+    color:#fff;
+    border:none;
+    border-radius:8px;
+    padding:8px 18px;
+    cursor:pointer;
+    font-size:14px;
+    z-index:10000;
+  }
+  #imgModalClose:hover {
+    background:#dc2626;
+  }
+  #imgModalImg {
+    max-width:90vw;
+    max-height:82vh;
+    object-fit:contain;
+    border-radius:8px;
+    display:block;
+    margin:0 auto;
+  }
+  #imgModalInfo {
+    color:#e0e0e0;
+    padding:10px 0 4px 0;
+    font-size:13px;
+  }
 </style>
 </head>
 <body>
@@ -1035,6 +1083,15 @@ HTML_PAGE = r"""
 
 <div id="gallery">
   <div class="empty-msg">모델 로딩 후 폴더를 선택하고 인덱싱하세요.</div>
+</div>
+
+<!-- 이미지 팝업 모달 -->
+<div id="imgModal" onclick="closeImageModal()">
+  <div id="imgModalInner" onclick="event.stopPropagation()">
+    <button id="imgModalClose" onclick="closeImageModal()">✕ 닫기</button>
+    <img id="imgModalImg" src=""/>
+    <div id="imgModalInfo"></div>
+  </div>
 </div>
 
 <script>
@@ -1302,9 +1359,11 @@ function renderResults(results) {
   for (const r of results) {
     const score = (r.score * 100).toFixed(1);
     const imgSrc = r.thumb_b64 || "";
+    const safeName = (r.name || "").replace(/'/g, "\\'");
     html += `
       <div class="card">
         <img src="${imgSrc}"
+             onclick="showImageModal(this.src, '${safeName}', '${score}%')"
              onerror="this.style.display='none'"/>
         <div class="info">
           <span class="score">${score}%</span> · ${r.name}
@@ -1320,9 +1379,11 @@ function renderRecent(items) {
   let html = '<div style="grid-column:1/-1;color:#7eb8ff;font-size:13px;padding:4px 0;">📌 인덱싱 완료된 이미지 (최신순)</div>';
   for (const r of items) {
     const imgSrc = r.thumb_b64 || "";
+    const safeName = (r.name || "").replace(/'/g, "\\'");
     html += `
       <div class="card">
         <img src="${imgSrc}"
+             onclick="showImageModal(this.src, '${safeName}', '')"
              onerror="this.style.display='none'"/>
         <div class="info">✅ ${r.name}</div>
       </div>`;
@@ -1348,6 +1409,31 @@ async function changeLanguage() {
     setStatus("❌ 언어 변경 오류: " + e);
   }
 }
+
+// ── 이미지 팝업 모달 ──────────────────────────────────────
+function showImageModal(src, name, score) {
+  if (!src) return;
+  const modal = document.getElementById("imgModal");
+  const modalImg = document.getElementById("imgModalImg");
+  const modalInfo = document.getElementById("imgModalInfo");
+  modalImg.src = src;
+  modalInfo.textContent = name + (score ? " · " + score : "");
+  modal.style.display = "flex";
+  document.body.style.overflow = "hidden";
+}
+
+function closeImageModal() {
+  const modal = document.getElementById("imgModal");
+  modal.style.display = "none";
+  document.getElementById("imgModalImg").src = "";
+  document.body.style.overflow = "";
+}
+
+document.addEventListener("keydown", function(e) {
+  if (e.key === "Escape") {
+    closeImageModal();
+  }
+});
 
 function setStatus(msg) {
   document.getElementById("status").textContent = msg;
