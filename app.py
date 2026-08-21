@@ -16,6 +16,8 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore", message="Palette images")
 
+import io
+import base64
 import numpy as np
 import requests
 import torch
@@ -50,6 +52,75 @@ WEIGHT_URL = (
 )
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".gif"}
+
+# ── 번역 모델 정의 ──────────────────────────────────────────
+import locale
+
+TRANSLATION_MODEL_FILES = [
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "source.spm",
+    "special_tokens_map.json",
+    "target.spm",
+    "tokenizer_config.json",
+    "vocab.json",
+    "vocab.spm",
+    "added_tokens.json",
+]
+
+TRANSLATION_LANGS = {
+    "kor": {"name": "한국어",           "model": "kor-eng"},
+    "fra": {"name": "Français",        "model": "fra-eng"},
+    "deu": {"name": "Deutsch",          "model": "deu-eng"},
+    "ita": {"name": "Italiano",         "model": "ita-eng"},
+    "nld": {"name": "Nederlands",       "model": "nld-eng"},
+    "rus": {"name": "Русский",          "model": "rus-eng"},
+    "ara": {"name": "العربية",          "model": "ara-eng"},
+    "zho": {"name": "中文",             "model": "zho-eng"},
+    "ell": {"name": "Ελληνικά",         "model": "ell-eng"},
+    "tur": {"name": "Türkçe",           "model": "tur-eng"},
+    "spa": {"name": "Español",          "model": "spa-eng"},
+    "cat": {"name": "Català",           "model": "cat-eng"},
+    "eng": {"name": "English (원본)",   "model": None},
+}
+
+TRANSLATION_DOWNLOAD_URLS = {}
+for _code, _info in TRANSLATION_LANGS.items():
+    if _info["model"] is not None:
+        _base = f"https://huggingface.co/Helsinki-NLP/opus-mt_tiny_{_info['model']}/resolve/main"
+        TRANSLATION_DOWNLOAD_URLS[_info["model"]] = {
+            fname: f"{_base}/{fname}" for fname in TRANSLATION_MODEL_FILES
+        }
+
+def _detect_pc_language() -> str:
+    """PC 기본 언어를 ISO 639-1 코드로 반환."""
+    try:
+        lang_code = locale.getlocale()[0]
+        if lang_code:
+            short = lang_code.split("_")[0].lower()
+            if short in TRANSLATION_LANGS:
+                return short
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            _map = {
+                0x0412: "kor", 0x040C: "fra", 0x0407: "deu",
+                0x0410: "ita", 0x0413: "nld", 0x0419: "rus",
+                0x0401: "ara", 0x0804: "zho", 0x0408: "ell",
+                0x041F: "tur", 0x0C0A: "spa", 0x040A: "spa",
+                0x0403: "cat", 0x0409: "eng",
+            }
+            if lang_id in _map:
+                return _map[lang_id]
+        except Exception:
+            pass
+    return "eng"
+
+PC_LANGUAGE = _detect_pc_language()
 
 # ── 로깅 설정 ────────────────────────────────────────────────
 os.makedirs(LOCAL_APP_DATA, exist_ok=True)
@@ -251,7 +322,222 @@ class Api:
         self._download_pct = 0.0
         self._download_msg = ""
         self._model_ready = False
-        logger.info("[Api] 초기화 완료")
+        self.recent_indexed: list[dict] = []
+        self.translator_model = None
+        self.translator_tokenizer = None
+        self.selected_lang = PC_LANGUAGE
+        self.last_indexed_folder = ""
+        self._index_path = os.path.join(LOCAL_APP_DATA, "zvec_index.npz")
+        self._index_meta_path = os.path.join(LOCAL_APP_DATA, "zvec_index.json")
+        self._index_state_path = os.path.join(LOCAL_APP_DATA, "index_state.json")
+        logger.info("[Api] 초기화 완료 (PC 언어: %s)", PC_LANGUAGE)
+
+    # ── 인덱스 상태 저장 (폴더 경로 포함) ─────────────────────
+    def _save_index_state(self, folder: str):
+        try:
+            state = {
+                "folder": folder,
+                "count": len(self.zvec_db),
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(self._index_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            self.last_indexed_folder = folder
+            logger.info("[상태] 인덱스 상태 저장: %s", state)
+        except Exception as e:
+            logger.error("[상태] 저장 실패: %s", e)
+
+    # ── 인덱스 상태 복원 ──────────────────────────────────────
+    def _try_auto_load_index(self):
+        try:
+            if not (os.path.isfile(self._index_path) and os.path.isfile(self._index_meta_path)):
+                logger.info("[자동로드] 저장된 인덱스 없음")
+                return {"loaded": False, "msg": "저장된 인덱스 없음"}
+
+            self.zvec_db.load(self._index_path)
+
+            folder = ""
+            if os.path.isfile(self._index_state_path):
+                with open(self._index_state_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                folder = state.get("folder", "")
+
+            self.last_indexed_folder = folder
+            self.indexed_count = len(self.zvec_db)
+            self.total_images = len(self.zvec_db)
+            self.progress_msg = (
+                f"이전 인덱스 자동 로드 완료: {len(self.zvec_db)}개 이미지"
+                f" (폴더: {folder})"
+            )
+
+            # recent_indexed 복원 (메타에서 상위 30개)
+            self.recent_indexed = []
+            for i in range(max(0, len(self.zvec_db) - 30), len(self.zvec_db)):
+                meta = self.zvec_db.meta[i]
+                p = meta.get("path", "")
+                self.recent_indexed.append({
+                    "path": p,
+                    "name": meta.get("name", Path(p).name if p else ""),
+                })
+            # thumb_b64는 메모리 절약을 위해 lazy 생성 안 함 (요청 시 생성)
+
+            logger.info("[자동로드] 완료: %d개, 폴더: %s", len(self.zvec_db), folder)
+            return {"loaded": True, "count": len(self.zvec_db), "folder": folder}
+        except Exception as e:
+            logger.error("[자동로드] 실패: %s", e, exc_info=True)
+            return {"loaded": False, "msg": str(e)}
+
+    # ── 언어 리스트 조회 (JS용) ──────────────────────────────
+    def get_language_list(self):
+        langs = []
+        for code, info in TRANSLATION_LANGS.items():
+            langs.append({"code": code, "name": info["name"]})
+        return {"ok": True, "langs": langs, "default": PC_LANGUAGE}
+
+    # ── 번역 모델 다운로드 + 로드 ────────────────────────────
+    def load_translator(self, lang_code: str):
+        logger.info("[이벤트] 번역 모델 로드 요청: %s", lang_code)
+        block = self._check_ready()
+        if block:
+            return block
+
+        if lang_code == "eng":
+            self.selected_lang = "eng"
+            self.translator_model = None
+            self.translator_tokenizer = None
+            logger.info("[번역] 영어 선택 → 번역 불필요")
+            return {"ok": True, "msg": "영어 선택됨 (번역 불필요)"}
+
+        info = TRANSLATION_LANGS.get(lang_code)
+        if not info or info["model"] is None:
+            return {"ok": False, "msg": f"지원하지 않는 언어: {lang_code}"}
+
+        model_pair = info["model"]
+        local_dir = os.path.join(LOCAL_APP_DATA, "translation", model_pair)
+        os.makedirs(local_dir, exist_ok=True)
+
+        missing = []
+        for fname in TRANSLATION_MODEL_FILES:
+            fpath = os.path.join(local_dir, fname)
+            if not os.path.isfile(fpath):
+                url = TRANSLATION_DOWNLOAD_URLS[model_pair][fname]
+                missing.append((fname, url, fpath))
+
+        if missing:
+            logger.info("[번역] 다운로드 필요 파일: %d개", len(missing))
+            threading.Thread(
+                target=self._download_translator_files,
+                args=(missing, local_dir, model_pair, lang_code),
+                daemon=True,
+            ).start()
+            return {"ok": True, "msg": f"번역 모델 다운로드 시작 ({len(missing)}개 파일)"}
+
+        return self._load_translator_model(local_dir, lang_code, model_pair)
+
+    def _download_translator_files(self, missing, local_dir, model_pair, lang_code):
+        try:
+            for fname, url, fpath in missing:
+                self._download_msg = f"번역 모델 다운로드: {fname}"
+                self._download_file_with_progress(url, fpath, fname)
+            logger.info("[번역] 다운로드 완료")
+            self._load_translator_model(local_dir, lang_code, model_pair)
+        except Exception as e:
+            logger.error("[번역] 다운로드 실패: %s", e, exc_info=True)
+            self._download_msg = f"번역 모델 다운로드 실패: {e}"
+
+    def _load_translator_model(self, local_dir, lang_code, model_pair):
+        try:
+            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+            logger.info("[번역] 모델 로드 중: %s", local_dir)
+            self.translator_tokenizer = AutoTokenizer.from_pretrained(local_dir)
+            self.translator_model = AutoModelForSeq2SeqLM.from_pretrained(local_dir)
+            self.translator_model.eval()
+            self.translator_model = self.translator_model.to(self.device)
+            self.selected_lang = lang_code
+            logger.info("[번역] 모델 로드 완료: %s", model_pair)
+            return {"ok": True, "msg": f"번역 모델 로드 완료 ({model_pair})"}
+        except Exception as e:
+            logger.error("[번역] 모델 로드 실패: %s", e, exc_info=True)
+            return {"ok": False, "msg": str(e)}
+
+    # ── 텍스트에 해당 언어가 포함되어 있는지 감지 ────────────
+    def _has_target_lang(self, text: str, lang_code: str) -> bool:
+        if lang_code == "kor":
+            for ch in text:
+                if '\uac00' <= ch <= '\ud7a3' or '\u1100' <= ch <= '\u11ff':
+                    return True
+            return False
+        elif lang_code == "zho":
+            for ch in text:
+                if '\u4e00' <= ch <= '\u9fff':
+                    return True
+            return False
+        elif lang_code == "ara":
+            for ch in text:
+                if '\u0600' <= ch <= '\u06ff':
+                    return True
+            return False
+        elif lang_code == "ell":
+            for ch in text:
+                if '\u0370' <= ch <= '\u03ff':
+                    return True
+            return False
+        elif lang_code == "rus":
+            for ch in text:
+                if '\u0400' <= ch <= '\u04ff':
+                    return True
+            return False
+        # 라틴 문자 기반 언어 (fra, deu, ita, nld, tur, spa, cat)
+        # 영어와 구분이 어려우므로 번역 모델이 있으면 항상 번역 시도
+        return True
+
+    # ── 번역 실행 ─────────────────────────────────────────────
+    def _translate_to_english(self, text: str) -> str:
+        if self.translator_model is None or self.translator_tokenizer is None:
+            return text
+        try:
+            inputs = self.translator_tokenizer(
+                text, return_tensors="pt", truncation=True, max_length=128
+            ).to(self.device)
+            with torch.inference_mode():
+                outputs = self.translator_model.generate(
+                    **inputs, max_length=128, num_beams=4
+                )
+            result = self.translator_tokenizer.decode(
+                outputs[0], skip_special_tokens=True
+            ).strip()
+            return result
+        except Exception as e:
+            logger.warning("[번역] 실패: %s", e)
+            return text
+
+    # ── 앱 시작 시 번역 모델 자동 로드 ────────────────────────
+    def _auto_load_translator(self, lang_code: str):
+        """앱 시작 시 PC 기본 언어 번역 모델 자동 로드."""
+        try:
+            info = TRANSLATION_LANGS.get(lang_code)
+            if not info or info["model"] is None:
+                return
+            model_pair = info["model"]
+            local_dir = os.path.join(LOCAL_APP_DATA, "translation", model_pair)
+            os.makedirs(local_dir, exist_ok=True)
+
+            missing = []
+            for fname in TRANSLATION_MODEL_FILES:
+                fpath = os.path.join(local_dir, fname)
+                if not os.path.isfile(fpath):
+                    url = TRANSLATION_DOWNLOAD_URLS[model_pair][fname]
+                    missing.append((fname, url, fpath))
+
+            if missing:
+                logger.info("[번역] 자동 다운로드: %d개 파일", len(missing))
+                for fname, url, fpath in missing:
+                    self._download_msg = f"번역 모델 다운로드: {fname}"
+                    self._download_file_with_progress(url, fpath, fname)
+
+            self._load_translator_model(local_dir, lang_code, model_pair)
+        except Exception as e:
+            logger.error("[번역] 자동 로드 실패: %s", e, exc_info=True)
 
     # ── 모델 준비 체크 (모든 이벤트 진입점) ──────────────────
     def _check_ready(self):
@@ -280,12 +566,30 @@ class Api:
             model_dir = self._ensure_model_files_with_progress()
             logger.info("[모델] 모델 디렉토리: %s", model_dir)
             self._download_msg = "모델 가중치 로드 중..."
-            self._download_pct = 99.0
+            self._download_pct = 90.0
             self.model, self.processor, self.device = load_raon_model(model_dir)
             logger.info("[모델] 로드 완료, 디바이스: %s", self.device)
+
+            # 모델 로드 후 이전 인덱스 자동 복원
+            self._download_msg = "이전 인덱스 확인 중..."
+            self._download_pct = 93.0
+            auto = self._try_auto_load_index()
+
+            # PC 기본 언어 번역 모델 자동 로드
+            if PC_LANGUAGE != "eng":
+                self._download_msg = f"번역 모델 로드 중 ({PC_LANGUAGE})..."
+                self._download_pct = 96.0
+                self._auto_load_translator(PC_LANGUAGE)
+
+            if auto.get("loaded"):
+                self._download_msg = (
+                    f"모델 로드 완료! 이전 인덱스 {auto['count']}개 복원됨"
+                )
+            else:
+                self._download_msg = "모델 로드 완료!"
+
             self._model_ready = True
             self._download_pct = 100.0
-            self._download_msg = "모델 로드 완료!"
         except Exception as e:
             logger.error("[모델 초기화 오류] %s", e, exc_info=True)
             self._download_msg = f"오류: {e}"
@@ -444,9 +748,7 @@ class Api:
                         spatial_shapes=spatial_shapes,
                     )  # [B, 1152]
 
-                feats_np = feats.float().cpu().numpy()
-                del pixel_values, pixel_mask, spatial_shapes, feats
-                gc.collect()
+                feats_np = feats.cpu().numpy()
                 for i, p in enumerate(valid_paths):
                     self.zvec_db.add(
                         vec_id=p,
@@ -454,17 +756,22 @@ class Api:
                         metadata={"path": p, "name": Path(p).name},
                     )
                     self.indexed_count += 1
+                    self.recent_indexed.append(
+                        {"path": p, "name": Path(p).name, "thumb_b64": self._make_thumb_b64(p)}
+                    )
+                    if len(self.recent_indexed) > 30:
+                        self.recent_indexed = self.recent_indexed[-30:]
 
                 self.progress_msg = (
                     f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
                 )
                 logger.info("[인덱싱] %s", self.progress_msg)
 
-            save_path = os.path.join(LOCAL_APP_DATA, "zvec_index.npz")
-            self.zvec_db.save(save_path)
+            self.zvec_db.save(self._index_path)
+            self._save_index_state(folder_path)
             self.progress_msg = (
                 f"인덱싱 완료! 총 {self.indexed_count}개 이미지. "
-                f"저장: {save_path}"
+                f"저장: {self._index_path}"
             )
             logger.info("[인덱싱] %s", self.progress_msg)
 
@@ -481,11 +788,20 @@ class Api:
             "[진행률] %d/%d indexing=%s",
             self.indexed_count, self.total_images, self._indexing,
         )
+        # thumb_b64가 없는 항목은 lazy 생성
+        recent_out = []
+        for r in reversed(self.recent_indexed):
+            item = dict(r)
+            if not item.get("thumb_b64") and item.get("path"):
+                item["thumb_b64"] = self._make_thumb_b64(item["path"])
+                r["thumb_b64"] = item["thumb_b64"]  # 캐시
+            recent_out.append(item)
         return {
             "indexing": self._indexing,
             "current": self.indexed_count,
             "total": self.total_images,
             "msg": self.progress_msg,
+            "recent": recent_out,
         }
 
     # ── 자연어 검색 ───────────────────────────────────────────
@@ -497,23 +813,51 @@ class Api:
         if len(self.zvec_db) == 0:
             logger.error("[검색] 인덱스 비어있음")
             return {"ok": False, "msg": "인덱스가 비어 있습니다. 먼저 인덱싱하세요."}
-
         try:
-            inputs = self.processor(text=[query])
+            translated = query
+            if self.selected_lang != "eng" and self._has_target_lang(query, self.selected_lang):
+                translated = self._translate_to_english(query)
+                logger.info("[번역] '%s' → '%s'", query, translated)
+
+            inputs = self.processor(text=[translated])
             input_ids = inputs["input_ids"].to(self.device)
             logger.debug("[검색] input_ids shape: %s", input_ids.shape)
-
             with torch.inference_mode():
                 text_feat = self.model.encode_text(input_ids)  # [1, 1152]
-
             text_np = text_feat.cpu().numpy().squeeze(0)
             logger.debug("[검색] text_feat shape: %s", text_np.shape)
             results = self.zvec_db.search(text_np, top_k=top_k)
+            for r in results:
+                r["thumb_b64"] = self._make_thumb_b64(r.get("path", ""))
             logger.info("[검색] 결과 %d개", len(results))
-            return {"ok": True, "results": results}
+            return {"ok": True, "results": results, "translated": translated}
         except Exception as e:
             logger.error("[검색 오류] %s", e, exc_info=True)
             return {"ok": False, "msg": str(e)}
+
+    # ── 썸네일 base64 생성 (크로스 플랫폼) ────────────────────
+    def _make_thumb_b64(self, path: str, size: int = 220) -> str:
+        try:
+            img = Image.open(path)
+            img.thumbnail((size, size), Image.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/jpeg;base64,{b64}"
+        except Exception as e:
+            logger.warning("[썸네일] 생성 실패: %s (%s)", path, e)
+            return ""
+
+    # ── 인덱스 상태 조회 (JS용) ───────────────────────────────
+    def get_index_state(self):
+        return {
+            "has_index": len(self.zvec_db) > 0,
+            "count": len(self.zvec_db),
+            "folder": self.last_indexed_folder,
+            "index_path": self._index_path,
+        }
 
     # ── zvec 인덱스 로드 ──────────────────────────────────────
     def load_index(self):
@@ -629,6 +973,11 @@ HTML_PAGE = r"""
   <button id="btnFolder" onclick="selectFolder()" disabled>📁 폴더 선택</button>
   <button id="btnIndex" onclick="startIndexing()" disabled>⚙️ 인덱싱 시작</button>
   <button id="btnLoadIdx" onclick="loadIndex()" disabled>📂 저장된 인덱스 로드</button>
+  <select id="langSelect" onchange="changeLanguage()" disabled
+          style="padding:10px 14px;border-radius:8px;border:1px solid #3a3d4a;
+                 background:#1e2130;color:#fff;font-size:14px;outline:none;
+                 cursor:pointer;">
+  </select>
   <div class="search-box">
     <input id="searchInput" type="text" disabled
            placeholder="자연어로 검색… 예: 바다 위 일몰, 빨간 자동차"
@@ -669,6 +1018,7 @@ function setButtonsEnabled(enabled) {
   document.getElementById("btnLoadIdx").disabled = !enabled;
   document.getElementById("btnSearch").disabled = !enabled;
   document.getElementById("searchInput").disabled = !enabled;
+  document.getElementById("langSelect").disabled = !enabled;
 }
 
 // ── 다운로드 폴링 ─────────────────────────────────────────
@@ -685,9 +1035,30 @@ function startDownloadPolling() {
         dlTimer = null;
         modelReady = true;
         setButtonsEnabled(true);
-        document.getElementById("btnIndex").disabled = true;
-        setStatus("✅ 모델 로드 완료! 폴더를 선택하세요.");
         document.getElementById("pbar").style.width = "100%";
+
+        // 이전 인덱스 상태 확인
+        try {
+          const st = await pywebview.api.get_index_state();
+          console.log("[JS] index_state:", JSON.stringify(st));
+          if (st.has_index && st.count > 0) {
+            selectedFolder = st.folder;
+            setStatus("✅ 모델 로드 완료! 이전 인덱스 " + st.count + "개 복원됨. 바로 검색 가능합니다.");
+            document.getElementById("btnIndex").disabled = false;
+            // 복원된 recent 표시
+            const p = await pywebview.api.get_progress();
+            if (p.recent && p.recent.length > 0) {
+              renderRecent(p.recent);
+            }
+          } else {
+            setStatus("✅ 모델 로드 완료! 폴더를 선택하세요.");
+            document.getElementById("btnIndex").disabled = true;
+          }
+        } catch(e) {
+          console.error("[JS] index_state 조회 예외:", e);
+          setStatus("✅ 모델 로드 완료! 폴더를 선택하세요.");
+          document.getElementById("btnIndex").disabled = true;
+        }
       } else if (!d.downloading && !d.ready) {
         clearInterval(dlTimer);
         dlTimer = null;
@@ -724,6 +1095,27 @@ window.addEventListener("DOMContentLoaded", function() {
       setStatus("❌ 초기화 오류: " + e);
       document.getElementById("btnDownload").style.display = "inline-block";
       document.getElementById("btnDownload").disabled = false;
+    }
+
+    // 언어 선택 드롭다운 초기화
+    try {
+      const langRes = await pywebview.api.get_language_list();
+      console.log("[JS] 언어 리스트:", JSON.stringify(langRes));
+      if (langRes.ok) {
+        const sel = document.getElementById("langSelect");
+        sel.innerHTML = "";
+        for (const l of langRes.langs) {
+          const opt = document.createElement("option");
+          opt.value = l.code;
+          opt.textContent = l.name;
+          if (l.code === langRes.default) {
+            opt.selected = true;
+          }
+          sel.appendChild(opt);
+        }
+      }
+    } catch(e) {
+      console.error("[JS] 언어 리스트 로드 예외:", e);
     }
   });
 });
@@ -794,6 +1186,11 @@ async function pollProgress() {
     setStatus("⚙️ " + p.msg);
     const pct = p.total > 0 ? Math.round(p.current / p.total * 100) : 0;
     document.getElementById("pbar").style.width = pct + "%";
+
+    if (p.recent && p.recent.length > 0) {
+      renderRecent(p.recent);
+    }
+
     if (!p.indexing) {
       clearInterval(pollTimer);
       document.getElementById("btnIndex").disabled = false;
@@ -829,8 +1226,22 @@ async function doSearch() {
     const res = await pywebview.api.search(q, 20);
     console.log("[JS] search 응답:", res.ok, res.results ? res.results.length : 0, "개");
     if (!res.ok) { setStatus("❌ " + res.msg); return; }
+    if (res.results.length === 0) {
+      const p = await pywebview.api.get_progress();
+      if (p.recent && p.recent.length > 0) {
+        setStatus("🔍 \"" + q + "\" → 검색 결과 없음. 최근 인덱싱된 이미지를 표시합니다.");
+        renderRecent(p.recent);
+      } else {
+        renderResults([]);
+        setStatus("🔍 \"" + q + "\" → 검색 결과 없음");
+      }
+      return;
+    }
     renderResults(res.results);
-    setStatus("🔍 \"" + q + "\" → " + res.results.length + "개 결과");
+    const transInfo = res.translated && res.translated !== q
+      ? " (번역: " + res.translated + ")"
+      : "";
+    setStatus("🔍 \"" + q + "\"" + transInfo + " → " + res.results.length + "개 결과");
   } catch(e) {
     console.error("[JS] doSearch 예외:", e);
     setStatus("❌ 검색 오류: " + e);
@@ -846,16 +1257,52 @@ function renderResults(results) {
   let html = "";
   for (const r of results) {
     const score = (r.score * 100).toFixed(1);
+    const imgSrc = r.thumb_b64 || "";
     html += `
       <div class="card">
-        <img src="local-file://${r.path.replace(/\\/g,'/')}"
-             onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22160%22><rect fill=%22%231a1d27%22 width=%22200%22 height=%22160%22/><text x=%2250%25%22 y=%2250%25%22 fill=%22%23555%22 text-anchor=%22middle%22>No Image</text></svg>'"/>
+        <img src="${imgSrc}"
+             onerror="this.style.display='none'"/>
         <div class="info">
           <span class="score">${score}%</span> · ${r.name}
         </div>
       </div>`;
   }
   g.innerHTML = html;
+}
+
+function renderRecent(items) {
+  const g = document.getElementById("gallery");
+  if (!items || items.length === 0) return;
+  let html = '<div style="grid-column:1/-1;color:#7eb8ff;font-size:13px;padding:4px 0;">📌 인덱싱 완료된 이미지 (최신순)</div>';
+  for (const r of items) {
+    const imgSrc = r.thumb_b64 || "";
+    html += `
+      <div class="card">
+        <img src="${imgSrc}"
+             onerror="this.style.display='none'"/>
+        <div class="info">✅ ${r.name}</div>
+      </div>`;
+  }
+  g.innerHTML = html;
+}
+
+async function changeLanguage() {
+  const sel = document.getElementById("langSelect");
+  const langCode = sel.value;
+  console.log("[JS] 언어 변경:", langCode);
+  try {
+    setStatus("🌐 번역 모델 로딩 중: " + sel.options[sel.selectedIndex].text);
+    const res = await pywebview.api.load_translator(langCode);
+    console.log("[JS] load_translator 응답:", JSON.stringify(res));
+    if (res.ok) {
+      setStatus("✅ " + res.msg);
+    } else {
+      setStatus("⚠️ " + res.msg);
+    }
+  } catch(e) {
+    console.error("[JS] changeLanguage 예외:", e);
+    setStatus("❌ 언어 변경 오류: " + e);
+  }
 }
 
 function setStatus(msg) {
@@ -871,10 +1318,24 @@ function setStatus(msg) {
 #  로컬 파일 서빙 (PyWebView이 file:// 이미지를 표시할 수 있게)
 # ============================================================
 def local_file_handler(path: str):
-    """local-file:// 스킴으로 들어온 경로를 실제 파일로 반환."""
+    """local-file:// 스킴으로 들어온 경로를 실제 파일로 반환.
+    Windows / macOS / Linux 모두 지원.
+    """
+    import urllib.parse
+
     real = path.replace("local-file://", "")
+    real = urllib.parse.unquote(real)
+
     if os.name == "nt":
+        # Windows: C:/Users/... 또는 /C:/Users/...
         real = real.lstrip("/")
+        if len(real) >= 2 and real[1] == ":":
+            pass  # C:/Users/... 형태 유지
+    else:
+        # macOS/Linux: /Users/... 또는 /home/...
+        if not real.startswith("/"):
+            real = "/" + real
+
     if os.path.isfile(real):
         return real
     return None
@@ -887,7 +1348,7 @@ def main():
     logger.info("[메인] PyWebView 창 생성 시작")
     api = Api()
     window = webview.create_window(
-        "XY Zvec - Raon Vision Search",
+        "Raon Vision Search",
         html=HTML_PAGE,
         js_api=api,
         width=1200,
