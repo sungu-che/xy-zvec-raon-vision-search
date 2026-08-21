@@ -1022,7 +1022,7 @@ HTML_PAGE = r"""
     gap:14px; align-content:start;
   }
   .card {
-    background:#1a1d27; border-radius:10px; overflow:hidden;
+    background:#1a1d27; border-radius:10px;
     border:1px solid #2a2d3a; transition:transform .15s;
   }
   .card:hover { transform:translateY(-3px); }
