@@ -119,23 +119,71 @@ if !errorlevel! equ 0 (
     exit /b 1
 )
 
+set GPU_TYPE=cpu
+
+REM -- NVIDIA GPU 감지 --
 nvidia-smi >nul 2>&1
 if %errorlevel% equ 0 (
-    echo.
-    echo [GPU] NVIDIA GPU detected. Attempting CUDA upgrade...
+    set GPU_TYPE=cuda
     for /f "tokens=*" %%d in ('nvidia-smi -L 2^>nul') do echo [GPU] %%d
-    echo [INFO] Force reinstalling PyTorch with CUDA 12.1...
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps
-    if !errorlevel! equ 0 (
-        echo [OK] Upgraded to CUDA 12.1 build.
-    ) else (
-        echo [WARN] CUDA upgrade failed. Staying on CPU build.
-    )
-) else (
-    echo [GPU] No NVIDIA GPU detected. Using CPU build.
+    goto :gpu_found
 )
 
-python -c "import torch; print('[VERIFY] PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())"
+REM -- AMD GPU 감지 (ROCm) --
+rocm-smi >nul 2>&1
+if %errorlevel% equ 0 (
+    set GPU_TYPE=rocm
+    echo [GPU] AMD GPU detected via rocm-smi
+    goto :gpu_found
+)
+
+REM -- Windows에서 AMD GPU 감지 (wmic) --
+for /f "tokens=*" %%g in ('wmic path win32_videocontroller get name 2^>nul ^| findstr /i "Radeon"') do (
+    set GPU_TYPE=rocm
+    echo [GPU] AMD GPU detected: %%g
+    goto :gpu_found
+)
+
+echo [GPU] No GPU detected. Using CPU build.
+goto :install_torch
+
+:gpu_found
+echo [GPU] Detected type: %GPU_TYPE%
+
+:install_torch
+if "%GPU_TYPE%"=="cuda" (
+    echo [INFO] Installing PyTorch with CUDA 12.1...
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps
+    if !errorlevel! equ 0 (
+        echo [OK] PyTorch CUDA 12.1 installed.
+    ) else (
+        echo [WARN] CUDA install failed. Falling back to CPU.
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
+    )
+) else if "%GPU_TYPE%"=="rocm" (
+    if "%OS%"=="Windows_NT" (
+        echo.
+        echo [WARN] ROCm is NOT supported on Windows.
+        echo [WARN] AMD GPU detected but using CPU build.
+        echo [WARN] For ROCm acceleration, run on Linux.
+        echo.
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
+    ) else (
+        echo [INFO] Installing PyTorch with ROCm 6.2...
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2 --force-reinstall --no-deps
+        if !errorlevel! equ 0 (
+            echo [OK] PyTorch ROCm 6.2 installed.
+        ) else (
+            echo [WARN] ROCm install failed. Falling back to CPU.
+            pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
+        )
+    )
+) else (
+    echo [INFO] Installing PyTorch CPU build...
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
+)
+
+python -c "import torch; hip = getattr(torch.version, 'hip', None); mode = 'ROCm' if hip else ('CUDA' if torch.cuda.is_available() else 'CPU'); print('[VERIFY] PyTorch:', torch.__version__, '| Accelerator:', mode, '| Available:', torch.cuda.is_available())"
 
 echo.
 echo ============================================================

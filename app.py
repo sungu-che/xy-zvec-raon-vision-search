@@ -268,6 +268,15 @@ def ensure_model_files() -> str:
     return LOCAL_APP_DATA
 
 
+def _detect_accelerator():
+    """사용 가능한 GPU 가속기를 감지 (CUDA / ROCm / CPU)."""
+    if torch.cuda.is_available():
+        if hasattr(torch.version, "hip") and torch.version.hip is not None:
+            return torch.device("cuda"), "ROCm (AMD GPU)"
+        return torch.device("cuda"), "CUDA (NVIDIA GPU)"
+    return torch.device("cpu"), "CPU"
+
+
 def load_raon_model(model_dir: str):
     """RaonVEModel + Processor 로드 (float16, 메모리 최적화)."""
     import gc
@@ -294,10 +303,10 @@ def load_raon_model(model_dir: str):
 
     model.eval()
     model = model.half()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, accel_name = _detect_accelerator()
     model = model.to(device)
     gc.collect()
-    logger.info("[모델] 디바이스: %s, dtype: float16", device)
+    logger.info("[모델] 디바이스: %s, 가속기: %s, dtype: float16", device, accel_name)
 
     logger.info("[프로세서] 로드 중…")
     processor = RaonVEProcessor.from_pretrained(model_dir)
